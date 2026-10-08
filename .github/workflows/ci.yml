@@ -27,6 +27,9 @@ jobs:
       - name: Install dependencies
         working-directory: frontend
         run: npm install --no-audit --no-fund
+      - name: Wallet read-only unit tests
+        working-directory: frontend
+        run: npm run test:wallet
       - name: Typecheck
         working-directory: frontend
         run: npm run typecheck
