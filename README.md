@@ -1,6 +1,15 @@
-# OSA Trading Desk V1 — PAPER ONLY
+# OSA Trading Desk V1.1 — PAPER ONLY + WALLET READ ONLY
 
-Solana research / paper-trading terminal with cinematic Polish UI. **No wallet code, no on-chain execution and no production deployment.** This software does not guarantee profits.
+Solana research / paper-trading terminal with cinematic Polish UI. **Wallet Standard connection and browser-side public balance reads only; no signing, no on-chain execution and no production deployment.** This software does not guarantee profits.
+
+## Wallet Connect V1.1
+
+- Browser-side Wallet Standard discovery limited to Phantom and Solflare (mainnet). User must explicitly connect; no auto-connect or session persistence. Connection is not permission to trade.
+- Separate `frontend/app/wallet-panel.tsx` and `frontend/lib/solana-readonly.mjs`: public address, SOL balance, legacy SPL Token and Token-2022 balances, read using HTTPS RPC. A failed request clears all displayed balances instead of showing stale/fake values.
+- Mainnet public RPC default: `https://api.mainnet-beta.solana.com`; optional `NEXT_PUBLIC_SOLANA_RPC_URL` uses an HTTPS endpoint. Any `NEXT_PUBLIC_*` variable is public in the browser: never insert an API secret here.
+- On Android, injected Wallet Standard providers appear inside a supporting wallet browser; opening a regular external Chrome tab may NOT find an installed wallet. No automatic deep links.
+- The wallet section is entirely independent of the FastAPI/Paper Engine. No wallet address is sent to the trading backend. RPC providers do see the public address requested.
+- The app only calls Wallet Standard `connect` and optional `disconnect`. It does not sign messages, transactions, or orders. The wallet itself controls connection approvals.
 
 ## Components
 
@@ -38,7 +47,7 @@ Open http://localhost:3000. Manual **SKANUJ SOLANA** reads live market data; **P
 
 ```bash
 cd backend && python -m pytest -q
-cd ../frontend && npm run typecheck && npm run build
+cd ../frontend && npm run test:wallet && npm run typecheck && npm run build
 ```
 
 ### Security / limitations

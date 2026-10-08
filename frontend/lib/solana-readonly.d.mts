@@ -1,0 +1,10 @@
+export type TokenView = {mint:string;amount:string;decimals:number};
+export type Portfolio = {address:string;network:string;sol:string;tokens:TokenView[];fetchedAt:string};
+export declare const DEFAULT_RPC:string;
+export declare const LEGACY_TOKEN_PROGRAM:string;
+export declare const TOKEN_2022_PROGRAM:string;
+export declare function validSolanaAddress(address:unknown):boolean;
+export declare function supportedWallets<T extends {name:string;chains:readonly string[];features:Record<string,unknown>}>(wallets:readonly T[]):T[];
+export declare function selectMainnetAccount<T extends {address:string;chains:readonly string[]}>(accounts:readonly T[]):T|null;
+export declare function exactUnits(raw:string,decimals:number,precision?:number):string;
+export declare function readPortfolio(address:string,options?:{endpoint?:string;fetcher?:typeof fetch;signal?:AbortSignal}):Promise<Portfolio>;
