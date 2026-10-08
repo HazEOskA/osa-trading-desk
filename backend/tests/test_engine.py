@@ -82,3 +82,165 @@ async def test_market_failure_closed():
     m = Market(transport=httpx.MockTransport(lambda req: httpx.Response(500)))
     with pytest.raises(MarketUnavailable):
         await m.candidates()
+
+@pytest.mark.parametrize("exit_price", [1.3, 0.8])
+@pytest.mark.asyncio
+async def test_scanner_outage_still_exits_open_position(tmp_path, monkeypatch, exit_price):
+    from app import main as api
+    l = Ledger(str(tmp_path / 'scan_failure.db'))
+    assert l.buy(sample())['executed']
+    order = []
+
+    class BrokenScanner:
+        async def candidates(self):
+            order.append('scan')
+            raise MarketUnavailable('scanner offline')
+
+        async def quote(self, token, pair):
+            order.append('quote')
+            assert (token, pair) == ('TOKEN123', 'PAIR123')
+            return sample(price=exit_price)
+
+    async def unexpected_judge(_):
+        raise AssertionError('No AI approval or buy on scanner failure')
+
+    monkeypatch.setattr(api, 'ledger', l)
+    monkeypatch.setattr(api, 'market', BrokenScanner())
+    monkeypatch.setattr(api, 'judge', unexpected_judge)
+    result = await api.tick()
+    assert order == ['quote', 'scan']
+    assert result['scanner_status'] == 'DEGRADED'
+    assert result['reason'] == 'SCAN_UNAVAILABLE'
+    assert result['scanned'] == 0
+    assert len(result['outcomes']) == 1 and result['outcomes'][0]['side'] == 'SELL'
+    assert not l.state()['positions']
+    assert l.verify_evidence()
+
+
+@pytest.mark.asyncio
+async def test_scanner_and_position_quote_outage_fails_closed(tmp_path, monkeypatch):
+    from app import main as api
+    l = Ledger(str(tmp_path / 'both_down.db'))
+    assert l.buy(sample())['executed']
+
+    class AllDown:
+        async def candidates(self):
+            raise MarketUnavailable('scanner offline')
+
+        async def quote(self, token, pair):
+            raise MarketUnavailable('quote offline')
+
+    monkeypatch.setattr(api, 'ledger', l)
+    monkeypatch.setattr(api, 'market', AllDown())
+    result = await api.tick()
+    assert result['reason'] == 'SCAN_UNAVAILABLE'
+    assert result['outcomes'] == [{'executed': False, 'reason': 'POSITION_QUOTE_UNAVAILABLE', 'token': 'TOKEN123'}]
+    assert len(l.state()['positions']) == 1
+    assert len(l.state()['fills']) == 1  # No synthetic close
+    assert l.verify_evidence()
+
+
+@pytest.mark.asyncio
+async def test_scanner_get_still_returns_503_on_outage(tmp_path, monkeypatch):
+    from app import main as api
+    from fastapi import HTTPException
+
+    class BrokenScanner:
+        async def candidates(self):
+            raise MarketUnavailable('offline')
+
+    monkeypatch.setattr(api, 'market', BrokenScanner())
+    with pytest.raises(HTTPException) as exc:
+        await api.scan()
+    assert exc.value.status_code == 503
+
+
+@pytest.mark.parametrize(('field', 'changed', 'side'), [
+    ('usd', 999999, 'BUY'),
+    ('units', 1, 'BUY'),
+    ('fee', 42, 'SELL'),
+    ('reference', 0.1, 'SELL'),
+    ('execution', 0.1, 'BUY'),
+    ('realized_pnl', 8000, 'SELL'),
+    ('token', 'FAKE', 'BUY'),
+    ('symbol', 'FAKE', 'SELL'),
+    ('time', 1, 'BUY'),
+    ('market_observed_at', 1, 'BUY'),
+    ('evidence_hash', 'fake-hash', 'SELL'),
+])
+def test_fill_mutations_break_evidence(tmp_path, field, changed, side):
+    path = str(tmp_path / 'tamper.db')
+    l = Ledger(path)
+    assert l.buy(sample())['executed']
+    assert l.sell(sample(price=1.3))['executed']
+    assert l.verify_evidence()
+    with sqlite3.connect(path) as db:
+        db.execute(f'UPDATE fills SET {field}=? WHERE side=?', (changed, side))
+    assert not l.verify_evidence()
+
+
+@pytest.mark.parametrize('mutation', [
+    'DELETE FROM fills WHERE side="BUY"',
+    'DELETE FROM fills WHERE side="SELL"',
+    'INSERT INTO fills(time,side,token,symbol,units,reference,execution,fee,usd,realized_pnl,market_observed_at,evidence_hash) SELECT time,side,token,symbol,units,reference,execution,fee,usd,realized_pnl,market_observed_at,evidence_hash FROM fills WHERE side="BUY"',
+    'UPDATE fills SET evidence_hash=(SELECT evidence_hash FROM fills WHERE side="SELL") WHERE side="BUY"',
+])
+def test_fill_missing_extra_or_duplicate_binding_breaks_evidence(tmp_path, mutation):
+    path = str(tmp_path / 'tamper.db')
+    l = Ledger(path)
+    assert l.buy(sample())['executed']
+    assert l.sell(sample(price=1.3))['executed']
+    assert l.verify_evidence()
+    with sqlite3.connect(path) as db:
+        db.execute(mutation)
+    assert not l.verify_evidence()
+
+
+def test_missing_fill_event_breaks_evidence(tmp_path):
+    path = str(tmp_path / 'tamper.db')
+    l = Ledger(path)
+    assert l.buy(sample())['executed']
+    with sqlite3.connect(path) as db:
+        db.execute('DELETE FROM events WHERE kind="PAPER_FILL"')
+    assert not l.verify_evidence()
+
+
+def test_old_fill_without_symbol_binding_fails_closed(tmp_path):
+    """Legacy local fills cannot be advertised as fully verified after upgrade."""
+    path = str(tmp_path / 'legacy.db')
+    l = Ledger(path)
+    assert l.buy(sample())['executed']
+    with sqlite3.connect(path) as db:
+        row = db.execute('SELECT * FROM events WHERE kind="PAPER_FILL"').fetchone()
+        payload = __import__('json').loads(row[3]); payload.pop('symbol')
+        content = __import__('json').dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+        digest = __import__('hashlib').sha256(f'GENESIS|{row[1]}|PAPER_FILL|{content}'.encode()).hexdigest()
+        db.execute('UPDATE events SET payload=?,hash=? WHERE id=?', (content, digest, row[0]))
+        db.execute('UPDATE fills SET evidence_hash=?', (digest,))
+    assert not l.verify_evidence()
+
+@pytest.mark.asyncio
+async def test_http_tick_degraded_and_proof_detects_fill_tamper(tmp_path, monkeypatch):
+    from app import main as api
+    l = Ledger(str(tmp_path / 'http.db'))
+    assert l.buy(sample())['executed']
+
+    class PartialDown:
+        async def candidates(self):
+            raise MarketUnavailable('scanner offline')
+
+        async def quote(self, token, pair):
+            return sample(price=0.8)  # stop loss works despite scanner failure
+
+    monkeypatch.setattr(api, 'ledger', l)
+    monkeypatch.setattr(api, 'market', PartialDown())
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app), base_url='http://test') as client:
+        r = await client.post('/api/paper/tick')
+        assert r.status_code == 200
+        assert r.json()['scanner_status'] == 'DEGRADED'
+        assert r.json()['outcomes'][0]['side'] == 'SELL'
+        assert (await client.get('/api/proof')).json()['verified'] is True
+        with sqlite3.connect(l.path) as conn:
+            conn.execute("UPDATE fills SET usd=999999 WHERE side='BUY'")
+        assert (await client.get('/api/proof')).json()['verified'] is False
+        assert (await client.get('/api/health')).json()['onchain_enabled'] is False

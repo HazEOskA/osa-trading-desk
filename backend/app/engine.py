@@ -94,10 +94,10 @@ class Ledger:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _event(self, conn, kind: str, payload: dict) -> str:
+    def _event(self, conn, kind: str, payload: dict, timestamp: int | None = None) -> str:
         previous = conn.execute('SELECT hash FROM events ORDER BY id DESC LIMIT 1').fetchone()
         prev_hash = previous['hash'] if previous else 'GENESIS'
-        timestamp = int(time.time())
+        timestamp = int(time.time()) if timestamp is None else timestamp
         body = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
         digest = hashlib.sha256(f'{prev_hash}|{timestamp}|{kind}|{body}'.encode()).hexdigest()
         conn.execute('INSERT INTO events (time,kind,payload,prev_hash,hash) VALUES (?,?,?,?,?)',
@@ -144,13 +144,15 @@ class Ledger:
             conn.execute('UPDATE wallet SET cash=cash-? WHERE id=1', (budget,))
             conn.execute('INSERT INTO positions VALUES (?,?,?,?,?,?,?)',
                          (pair.token, pair.pair, pair.symbol, units, budget, executed_price, int(time.time())))
-            payload = {'side': 'BUY', 'token': pair.token, 'pair': pair.pair, 'reference': pair.price,
+            fill_time = int(time.time())
+            payload = {'side': 'BUY', 'token': pair.token, 'pair': pair.pair, 'symbol': pair.symbol,
+                       'reference': pair.price,
                        'execution': executed_price, 'units': units, 'usd': budget, 'fee': fee,
                        'source': source, 'market_observed_at': pair.observed_at, 'market_url': pair.url}
-            digest = self._event(conn, 'PAPER_FILL', payload)
+            digest = self._event(conn, 'PAPER_FILL', payload, timestamp=fill_time)
             conn.execute('''INSERT INTO fills (time,side,token,symbol,units,reference,execution,fee,usd,realized_pnl,market_observed_at,evidence_hash)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
-                         (int(time.time()), 'BUY', pair.token, pair.symbol, units, pair.price, executed_price,
+                         (fill_time, 'BUY', pair.token, pair.symbol, units, pair.price, executed_price,
                           fee, budget, None, pair.observed_at, digest))
             return {'executed': True, 'side': 'BUY', 'token': pair.token, 'usd': round(budget, 2), 'evidence_hash': digest}
 
@@ -171,22 +173,53 @@ class Ledger:
             pnl = proceeds - pos['spent']
             conn.execute('UPDATE wallet SET cash=cash+? WHERE id=1', (proceeds,))
             conn.execute('DELETE FROM positions WHERE token=?', (pair.token,))
-            payload = {'side': 'SELL', 'token': pair.token, 'pair': pair.pair, 'reference': pair.price,
+            fill_time = int(time.time())
+            payload = {'side': 'SELL', 'token': pair.token, 'pair': pair.pair, 'symbol': pair.symbol,
+                       'reference': pair.price,
                        'execution': exec_price, 'units': pos['units'], 'usd': proceeds,
                        'fee': fee, 'realized_pnl': pnl, 'market_observed_at': pair.observed_at, 'market_url': pair.url}
-            digest = self._event(conn, 'PAPER_FILL', payload)
+            digest = self._event(conn, 'PAPER_FILL', payload, timestamp=fill_time)
             conn.execute('''INSERT INTO fills (time,side,token,symbol,units,reference,execution,fee,usd,realized_pnl,market_observed_at,evidence_hash)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
-                         (int(time.time()), 'SELL', pair.token, pair.symbol, pos['units'], pair.price,
+                         (fill_time, 'SELL', pair.token, pair.symbol, pos['units'], pair.price,
                           exec_price, fee, proceeds, pnl, pair.observed_at, digest))
             return {'executed': True, 'side': 'SELL', 'token': pair.token, 'realized_pnl': round(pnl, 4), 'evidence_hash': digest}
 
     def verify_evidence(self) -> bool:
+        """Verify local event chain plus a one-to-one binding of ALL paper fills.
+
+        This is a local consistency check, not an externally anchored receipt.
+        Legacy fill events without symbol/time binding fail closed.
+        """
         previous = 'GENESIS'
-        with self._db() as conn:
+        expected_fills: dict[str, tuple[dict[str, Any], int]] = {}
+        with self.lock, self._db() as conn:
             for event in conn.execute('SELECT * FROM events ORDER BY id'):
                 calculated = hashlib.sha256(f"{previous}|{event['time']}|{event['kind']}|{event['payload']}".encode()).hexdigest()
                 if event['prev_hash'] != previous or event['hash'] != calculated:
                     return False
+                if event['kind'] == 'PAPER_FILL':
+                    try:
+                        payload = json.loads(event['payload'])
+                    except (TypeError, ValueError):
+                        return False
+                    if not isinstance(payload, dict) or event['hash'] in expected_fills:
+                        return False
+                    expected_fills[event['hash']] = (payload, event['time'])
                 previous = event['hash']
-        return True
+            seen: set[str] = set()
+            fields = ('side', 'token', 'symbol', 'units', 'reference', 'execution',
+                      'fee', 'usd', 'realized_pnl', 'market_observed_at')
+            for fill in conn.execute('SELECT * FROM fills ORDER BY id'):
+                digest = fill['evidence_hash']
+                if digest in seen or digest not in expected_fills:
+                    return False
+                payload, event_time = expected_fills[digest]
+                if fill['time'] != event_time:
+                    return False
+                if any(field not in payload for field in fields if field != 'realized_pnl'):
+                    return False
+                if any(fill[field] != payload.get(field) for field in fields):
+                    return False
+                seen.add(digest)
+            return len(seen) == len(expected_fills)

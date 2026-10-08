@@ -19,28 +19,32 @@ async def tick():
     if _tick_lock.locked():
         raise HTTPException(409, 'Tick już trwa')
     async with _tick_lock:
+        state = ledger.state()
+        outcomes = []
+        # Manage existing positions before scanning; an upstream discovery outage
+        # must not prevent paper exits when fresh position quotes are available.
+        for position in state['positions']:
+            try:
+                quote = await market.quote(position['token'], position['pair'])
+                change = quote.price / position['entry_price'] - 1
+                if change <= -0.10 or change >= 0.20:
+                    outcomes.append(ledger.sell(quote))
+            except MarketUnavailable:
+                outcomes.append({'executed': False, 'reason': 'POSITION_QUOTE_UNAVAILABLE', 'token': position['token']})
+        if ledger.state()['halted']:
+            return {'mode': 'PAPER_ONLY', 'scanned': 0, 'outcomes': outcomes, 'reason': 'HALTED'}
         try:
             candidates = await market.candidates()
-            state = ledger.state()
-            outcomes = []
-            # Manage existing positions first; never close on stale or missing quotes.
-            for position in state['positions']:
-                try:
-                    quote = await market.quote(position['token'], position['pair'])
-                    change = quote.price / position['entry_price'] - 1
-                    if change <= -0.10 or change >= 0.20:
-                        outcomes.append(ledger.sell(quote))
-                except MarketUnavailable:
-                    outcomes.append({'executed': False, 'reason': 'POSITION_QUOTE_UNAVAILABLE', 'token': position['token']})
-            if not ledger.state()['halted']:
-                for pair in candidates:
-                    decision = await judge(pair)
-                    if decision['decision'] == 'BUY':
-                        outcomes.append(ledger.buy(pair, source=decision['source']))
-            return {'mode': 'PAPER_ONLY', 'scanned': len(candidates), 'outcomes': outcomes,
-                    'rules': 'Obowiązkowe filtry + opcjonalny AI Judge; brak AI oznacza brak BUY'}
-        except MarketUnavailable as exc:
-            raise HTTPException(503, str(exc)) from exc
+        except MarketUnavailable:
+            # Paper exits already processed; never BUY without a valid scan.
+            return {'mode': 'PAPER_ONLY', 'scanned': 0, 'outcomes': outcomes,
+                    'reason': 'SCAN_UNAVAILABLE', 'scanner_status': 'DEGRADED'}
+        for pair in candidates:
+            decision = await judge(pair)
+            if decision['decision'] == 'BUY':
+                outcomes.append(ledger.buy(pair, source=decision['source']))
+        return {'mode': 'PAPER_ONLY', 'scanned': len(candidates), 'outcomes': outcomes,
+                'rules': 'Obowiązkowe filtry + opcjonalny AI Judge; brak AI oznacza brak BUY'}
 
 
 async def automatic_loop():
@@ -110,5 +114,5 @@ def resume():
 
 @app.get('/api/proof')
 def proof():
-    return {'verified': ledger.verify_evidence(), 'algorithm': 'SHA256_CHAIN',
-            'scope': 'Local append-only event integrity, NOT blockchain settlement'}
+    return {'verified': ledger.verify_evidence(), 'algorithm': 'SHA256_CHAIN_AND_FILL_BINDING',
+            'scope': 'Local chain and paper-fill consistency; no external anchor or blockchain settlement'}
