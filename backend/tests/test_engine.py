@@ -6,6 +6,19 @@ import pytest
 from app.engine import Ledger, Pair, evaluate, parse_pair
 from app.judge import judge
 from app.market import Market, MarketUnavailable
+from app.risk_gate import CueReport, RiskGate, REQUIRED_CHECKS
+
+
+def verified_gate():
+    """Syntetyczny provider wyłącznie do testów; nigdy w main.py."""
+    def provider(pair):
+        return CueReport(
+            mint=pair.token, pair=pair.pair, observed_at=int(time.time()),
+            evidence_ref='TEST_ONLY_NOT_ONCHAIN',
+            checks={key: 'PASS' for key in REQUIRED_CHECKS},
+        )
+    return RiskGate(provider)
+
 
 
 def sample(price=1, age=5, observed=None):
@@ -20,7 +33,7 @@ def test_risk_rejects_unknowns():
 
 
 def test_paper_buy_sell_and_proof(tmp_path):
-    l = Ledger(str(tmp_path / 'paper.db'))
+    l = Ledger(str(tmp_path / 'paper.db'), risk_gate=verified_gate())
     assert l.state()['cash'] == 1000
     buy = l.buy(sample())
     assert buy['executed'] and buy['side'] == 'BUY'
@@ -30,13 +43,13 @@ def test_paper_buy_sell_and_proof(tmp_path):
     assert sell['executed'] and sell['realized_pnl'] > 0
     assert len(l.state()['positions']) == 0
     assert l.verify_evidence()
-    l2 = Ledger(str(tmp_path / 'paper.db'))
+    l2 = Ledger(str(tmp_path / 'paper.db'), risk_gate=verified_gate())
     assert len(l2.state()['fills']) == 2
     assert l2.verify_evidence()
 
 
 def test_halt_and_stale_fail_closed(tmp_path):
-    l = Ledger(str(tmp_path / 'paper.db'))
+    l = Ledger(str(tmp_path / 'paper.db'), risk_gate=verified_gate())
     assert l.buy(sample(observed=int(time.time()) - 300))['reason'] == 'STALE_MARKET_DATA'
     l.set_halt(True)
     assert l.buy(sample())['reason'] == 'HALTED'
@@ -46,7 +59,7 @@ def test_halt_and_stale_fail_closed(tmp_path):
 
 def test_event_tamper_detected(tmp_path):
     path = str(tmp_path / 'paper.db')
-    l = Ledger(path)
+    l = Ledger(path, risk_gate=verified_gate())
     l.buy(sample())
     with sqlite3.connect(path) as db:
         db.execute("UPDATE events SET payload='{}' WHERE id=1")
@@ -87,7 +100,7 @@ async def test_market_failure_closed():
 @pytest.mark.asyncio
 async def test_scanner_outage_still_exits_open_position(tmp_path, monkeypatch, exit_price):
     from app import main as api
-    l = Ledger(str(tmp_path / 'scan_failure.db'))
+    l = Ledger(str(tmp_path / 'scan_failure.db'), risk_gate=verified_gate())
     assert l.buy(sample())['executed']
     order = []
 
@@ -120,7 +133,7 @@ async def test_scanner_outage_still_exits_open_position(tmp_path, monkeypatch, e
 @pytest.mark.asyncio
 async def test_scanner_and_position_quote_outage_fails_closed(tmp_path, monkeypatch):
     from app import main as api
-    l = Ledger(str(tmp_path / 'both_down.db'))
+    l = Ledger(str(tmp_path / 'both_down.db'), risk_gate=verified_gate())
     assert l.buy(sample())['executed']
 
     class AllDown:
@@ -170,7 +183,7 @@ async def test_scanner_get_still_returns_503_on_outage(tmp_path, monkeypatch):
 ])
 def test_fill_mutations_break_evidence(tmp_path, field, changed, side):
     path = str(tmp_path / 'tamper.db')
-    l = Ledger(path)
+    l = Ledger(path, risk_gate=verified_gate())
     assert l.buy(sample())['executed']
     assert l.sell(sample(price=1.3))['executed']
     assert l.verify_evidence()
@@ -187,7 +200,7 @@ def test_fill_mutations_break_evidence(tmp_path, field, changed, side):
 ])
 def test_fill_missing_extra_or_duplicate_binding_breaks_evidence(tmp_path, mutation):
     path = str(tmp_path / 'tamper.db')
-    l = Ledger(path)
+    l = Ledger(path, risk_gate=verified_gate())
     assert l.buy(sample())['executed']
     assert l.sell(sample(price=1.3))['executed']
     assert l.verify_evidence()
@@ -198,7 +211,7 @@ def test_fill_missing_extra_or_duplicate_binding_breaks_evidence(tmp_path, mutat
 
 def test_missing_fill_event_breaks_evidence(tmp_path):
     path = str(tmp_path / 'tamper.db')
-    l = Ledger(path)
+    l = Ledger(path, risk_gate=verified_gate())
     assert l.buy(sample())['executed']
     with sqlite3.connect(path) as db:
         db.execute('DELETE FROM events WHERE kind="PAPER_FILL"')
@@ -208,7 +221,7 @@ def test_missing_fill_event_breaks_evidence(tmp_path):
 def test_old_fill_without_symbol_binding_fails_closed(tmp_path):
     """Legacy local fills cannot be advertised as fully verified after upgrade."""
     path = str(tmp_path / 'legacy.db')
-    l = Ledger(path)
+    l = Ledger(path, risk_gate=verified_gate())
     assert l.buy(sample())['executed']
     with sqlite3.connect(path) as db:
         row = db.execute('SELECT * FROM events WHERE kind="PAPER_FILL"').fetchone()
@@ -222,7 +235,7 @@ def test_old_fill_without_symbol_binding_fails_closed(tmp_path):
 @pytest.mark.asyncio
 async def test_http_tick_degraded_and_proof_detects_fill_tamper(tmp_path, monkeypatch):
     from app import main as api
-    l = Ledger(str(tmp_path / 'http.db'))
+    l = Ledger(str(tmp_path / 'http.db'), risk_gate=verified_gate())
     assert l.buy(sample())['executed']
 
     class PartialDown:
