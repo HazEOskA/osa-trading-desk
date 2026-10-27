@@ -40,11 +40,16 @@ async def tick():
             return {'mode': 'PAPER_ONLY', 'scanned': 0, 'outcomes': outcomes,
                     'reason': 'SCAN_UNAVAILABLE', 'scanner_status': 'DEGRADED'}
         for pair in candidates:
+            cue = ledger.risk_gate.assess(pair)
+            if not cue['allowed']:
+                outcomes.append({'executed': False, 'reason': 'CUE_RISK_BLOCKED',
+                                 'token': pair.token, 'cue': cue})
+                continue
             decision = await judge(pair)
             if decision['decision'] == 'BUY':
                 outcomes.append(ledger.buy(pair, source=decision['source']))
         return {'mode': 'PAPER_ONLY', 'scanned': len(candidates), 'outcomes': outcomes,
-                'rules': 'Obowiązkowe filtry + opcjonalny AI Judge; brak AI oznacza brak BUY'}
+                'rules': 'Filtry rynkowe + obowiązkowy CUE Risk Gate + opcjonalny AI Judge; brak aktualnego CUE = BLOCK'}
 
 
 async def automatic_loop():
@@ -90,9 +95,14 @@ async def scan():
     try:
         pairs = await market.candidates()
         return {'source': 'DEXSCREENER_LIVE', 'mode': 'PAPER_ONLY', 'candidates': [
-            {'pair': vars(p), 'assessment': evaluate(p)} for p in pairs]}
+            {'pair': vars(p), 'assessment': evaluate(p), 'cue': ledger.risk_gate.assess(p)} for p in pairs]}
     except MarketUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
+
+
+@app.get('/api/strategy')
+def strategy():
+    return ledger.risk_gate.public_state()
 
 
 @app.post('/api/paper/tick')
