@@ -8,6 +8,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from .risk_gate import RiskGate
 
 INITIAL_CASH = 1000.0
 FEE_RATE = 0.0025
@@ -71,8 +72,9 @@ def evaluate(pair: Pair) -> dict[str, Any]:
 
 class Ledger:
     """SQLite transactions and hash-linked append-only event log; no real assets."""
-    def __init__(self, path: str):
+    def __init__(self, path: str, risk_gate: RiskGate | None = None):
         self.path = path
+        self.risk_gate = risk_gate if risk_gate is not None else RiskGate()
         self.lock = threading.RLock()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with self._db() as conn:
@@ -126,6 +128,10 @@ class Ledger:
             return {'executed': False, 'reason': 'RISK_REJECT', 'assessment': assessment}
         if time.time() - pair.observed_at > 90 or pair.observed_at > time.time() + 10:
             return {'executed': False, 'reason': 'STALE_MARKET_DATA'}
+        # Mandatory second barrier: direct Ledger.buy cannot bypass CUE via AI or API.
+        cue = self.risk_gate.assess(pair)
+        if not cue['allowed']:
+            return {'executed': False, 'reason': 'CUE_RISK_BLOCKED', 'cue': cue}
         with self.lock, self._db() as conn:
             wallet = conn.execute('SELECT * FROM wallet WHERE id=1').fetchone()
             count = conn.execute('SELECT COUNT(*) c FROM positions').fetchone()['c']
@@ -148,7 +154,7 @@ class Ledger:
             payload = {'side': 'BUY', 'token': pair.token, 'pair': pair.pair, 'symbol': pair.symbol,
                        'reference': pair.price,
                        'execution': executed_price, 'units': units, 'usd': budget, 'fee': fee,
-                       'source': source, 'market_observed_at': pair.observed_at, 'market_url': pair.url}
+                       'source': source, 'strategy_id': cue['strategy_id'], 'cue_evidence_ref': cue.get('evidence_ref'), 'market_observed_at': pair.observed_at, 'market_url': pair.url}
             digest = self._event(conn, 'PAPER_FILL', payload, timestamp=fill_time)
             conn.execute('''INSERT INTO fills (time,side,token,symbol,units,reference,execution,fee,usd,realized_pnl,market_observed_at,evidence_hash)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
